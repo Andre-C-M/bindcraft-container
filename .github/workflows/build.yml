@@ -1,0 +1,32 @@
+name: Build BindCraft Container
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Singularity
+      uses: eWaterCycle/setup-singularity@v7
+      with:
+        singularity-version: 3.8.3
+    
+    - name: Build container
+      run: singularity build bindcraft.sif bindcraft.def
+    
+    - name: Test container
+      run: |
+        singularity exec bindcraft.sif python3 -c "print('Container works!')"
+        singularity exec bindcraft.sif python3 -c "import jax; print('JAX version:', jax.__version__)"
+    
+    - name: Upload container
+      uses: actions/upload-artifact@v4
+      with:
+        name: bindcraft-container
+        path: bindcraft.sif
+        retention-days: 30
