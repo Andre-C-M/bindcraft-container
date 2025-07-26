@@ -1,4 +1,4 @@
-name: Build BindCraft Container (Minimal)
+name: Build BindCraft Container (Reliable)
 
 on:
   push:
@@ -14,9 +14,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    
     - name: Free up disk space
       run: |
         sudo rm -rf /usr/share/dotnet
@@ -24,102 +21,138 @@ jobs:
         sudo rm -rf "$AGENT_TOOLSDIRECTORY"
         df -h
     
-    - name: Create minimal Dockerfile
+    - name: Install Singularity/Apptainer
       run: |
-        cat > Dockerfile << 'EOF'
-        FROM python:3.10-slim
-        
-        # Install system dependencies
-        RUN apt-get update && apt-get install -y \
-                git wget curl build-essential \
-                libgfortran5 libgomp1 \
-                ca-certificates && \
-            rm -rf /var/lib/apt/lists/*
-        
-        # Install Python packages one by one
-        RUN pip install --no-cache-dir numpy==2.0.1
-        RUN pip install --no-cache-dir scipy==1.15.3
-        RUN pip install --no-cache-dir pandas matplotlib biopython
-        RUN pip install --no-cache-dir jax==0.4.35
-        RUN pip install --no-cache-dir jaxlib==0.4.35
-        
-        # Install BindCraft dependencies - fix pdbfixer installation
-        RUN pip install --no-cache-dir 'pdbfixer @ git+https://github.com/openmm/pdbfixer.git'
-        RUN pip install --no-cache-dir pyrosetta-installer
-        RUN pip install --no-cache-dir git+https://github.com/sokrypton/ColabDesign.git
-        
-        # Clone BindCraft
-        RUN git clone https://github.com/martinpacesa/BindCraft /BindCraft
-        RUN chmod +x /BindCraft/functions/dssp /BindCraft/functions/DAlphaBall.gcc
-        RUN mkdir -p /BindCraft/params
-        
-        # Set environment
-        ENV PYTHONPATH="/BindCraft"
-        
-        WORKDIR /workspace
-        
-        # Simple entrypoint
-        CMD ["python3", "/BindCraft/bindcraft.py", "--help"]
-        EOF
-    
-    - name: Build Docker image
-      run: |
-        echo "Building minimal BindCraft image..."
-        docker build --progress=plain -t bindcraft-minimal .
-    
-    - name: Test Docker container
-      run: |
-        echo "Testing container..."
-        docker run --rm bindcraft-minimal python3 -c "print('✓ Container works')"
-        docker run --rm bindcraft-minimal python3 -c "import numpy; print('✓ NumPy')"
-        docker run --rm bindcraft-minimal python3 -c "import jax; print('✓ JAX')"
-        docker run --rm bindcraft-minimal ls /BindCraft/
-    
-    - name: Convert Docker to Singularity format
-      run: |
-        # Install Singularity for conversion
         sudo apt-get update
-        sudo apt-get install -y singularity-container
+        sudo apt-get install -y \
+          build-essential \
+          libseccomp-dev \
+          pkg-config \
+          uidmap \
+          squashfs-tools \
+          fakeroot \
+          cryptsetup \
+          tzdata \
+          curl wget git
         
-        # Save Docker image as tar
-        docker save bindcraft-minimal | gzip > bindcraft_docker.tar.gz
+        # Install Go
+        export VERSION=1.21.0 OS=linux ARCH=amd64
+        wget -q https://dl.google.com/go/go$VERSION.$OS-$ARCH.tar.gz
+        sudo tar -C /usr/local -xzf go$VERSION.$OS-$ARCH.tar.gz
+        rm go$VERSION.$OS-$ARCH.tar.gz
+        echo 'export PATH=/usr/local/go/bin:$PATH' >> ~/.bashrc
+        export PATH=/usr/local/go/bin:$PATH
         
-        # Create Singularity definition that imports the Docker image
-        cat > bindcraft_final.def << 'EOF'
-        Bootstrap: docker-archive
-        From: bindcraft_docker.tar.gz
+        # Install SingularityCE
+        export VERSION=4.0.1
+        wget -q https://github.com/sylabs/singularity/releases/download/v${VERSION}/singularity-ce-${VERSION}.tar.gz
+        tar -xzf singularity-ce-${VERSION}.tar.gz
+        cd singularity-ce-${VERSION}
+        ./mconfig
+        make -C builddir
+        sudo make -C builddir install
+        
+        # Test installation
+        singularity version
+    
+    - name: Create Singularity definition file
+      run: |
+        cat > bindcraft.def << 'EOF'
+        Bootstrap: docker
+        From: python:3.10-slim
+        
+        %post
+            # Install system dependencies
+            apt-get update && apt-get install -y \
+                    git wget curl build-essential \
+                    libgfortran5 libgomp1 \
+                    ca-certificates && \
+                rm -rf /var/lib/apt/lists/*
+            
+            # Upgrade pip and install wheel
+            pip install --upgrade pip setuptools wheel
+            
+            # Install core packages
+            pip install --no-cache-dir numpy==2.0.1 scipy==1.15.3
+            pip install --no-cache-dir pandas matplotlib biopython
+            pip install --no-cache-dir jax==0.4.35 jaxlib==0.4.35
+            
+            # Install ColabDesign
+            pip install --no-cache-dir git+https://github.com/sokrypton/ColabDesign.git
+            
+            # Install pdbfixer from git (the working method)
+            pip install --no-cache-dir 'pdbfixer @ git+https://github.com/openmm/pdbfixer.git'
+            
+            # Install PyRosetta installer
+            pip install --no-cache-dir pyrosetta-installer
+            
+            # Clone BindCraft
+            git clone https://github.com/martinpacesa/BindCraft /BindCraft
+            chmod +x /BindCraft/functions/dssp /BindCraft/functions/DAlphaBall.gcc
+            mkdir -p /BindCraft/params
+        
+        %environment
+            export PYTHONPATH="/BindCraft"
+            export PATH="/BindCraft:${PATH}"
+        
+        %runscript
+            # Install PyRosetta on first run if not present
+            if ! python -c "import pyrosetta" 2>/dev/null; then
+                echo "Installing PyRosetta (first run only, ~1.5GB)..."
+                python -c "import pyrosetta_installer; pyrosetta_installer.install_pyrosetta()" || echo "PyRosetta install failed"
+            fi
+            
+            # Download AlphaFold params on first run if not present
+            if [ ! -f /BindCraft/params/done.txt ]; then
+                echo "Downloading AlphaFold parameters (first run only, ~5.3GB)..."
+                cd /BindCraft/params
+                wget -q --timeout=60 --tries=3 \
+                    https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar
+                if [ $? -eq 0 ]; then
+                    tar -xf alphafold_params_2022-12-06.tar
+                    rm alphafold_params_2022-12-06.tar
+                    touch done.txt
+                    echo "✓ Parameters downloaded successfully"
+                else
+                    echo "⚠ Parameter download failed, will retry next run"
+                fi
+            fi
+            
+            echo "=== BindCraft Ready ==="
+            exec python /BindCraft/bindcraft.py "$@"
+        
+        %help
+            BindCraft container for protein binder design
+            
+            Usage:
+            singularity run --nv bindcraft.sif --settings your_settings.json
+            
+            First run will download PyRosetta (~1.5GB) and AlphaFold params (~5.3GB)
+            Subsequent runs will be much faster.
         EOF
+    
+    - name: Build Singularity container
+      run: |
+        echo "Building BindCraft Singularity container..."
+        singularity build --fakeroot bindcraft.sif bindcraft.def
         
-        # Build Singularity container
-        sudo singularity build bindcraft.sif bindcraft_final.def
-        
-        echo "✓ Singularity container created"
+        echo "✓ Container built successfully!"
         ls -lh bindcraft.sif
     
-    - name: Create conversion instructions
+    - name: Test container
       run: |
-        cat > CONVERSION_INSTRUCTIONS.txt << 'EOF'
-        # Convert Docker image to Singularity
-        
-        ## Method 1: Direct conversion (if Singularity available)
-        gunzip bindcraft.tar.gz
-        singularity build bindcraft.sif docker-archive://bindcraft.tar
-        
-        ## Method 2: Load and use as Docker
-        docker load < bindcraft.tar
-        docker tag bindcraft-minimal bindcraft:latest
-        
-        ## Usage:
-        # Singularity: singularity run --nv bindcraft.sif --settings config.json
-        # Docker: docker run --gpus all -v /data:/workspace bindcraft:latest --settings config.json
-        EOF
+        echo "Testing container basic functionality..."
+        singularity exec bindcraft.sif python -c "print('✓ Container works')"
+        singularity exec bindcraft.sif python -c "import numpy; print('✓ NumPy works')"
+        singularity exec bindcraft.sif python -c "import jax; print('✓ JAX works')"
+        singularity exec bindcraft.sif ls /BindCraft/ | head -5
+        echo "✓ All basic tests passed!"
     
-    - name: Upload artifacts
+    - name: Upload container
       uses: actions/upload-artifact@v4
       with:
-        name: bindcraft-container
-        path: |
-          bindcraft.sif
+        name: bindcraft-singularity
+        path: bindcraft.sif
         retention-days: 30
     
     - name: Success message
@@ -129,5 +162,11 @@ jobs:
         echo "============================================"
         echo "Container size: $(du -h bindcraft.sif | cut -f1)"
         echo ""
-        echo "Download from: Actions → Artifacts → bindcraft-container"
-        echo "Usage on Raven: singularity run --nv bindcraft.sif --settings config.json"
+        echo "Download from: Actions → Artifacts → bindcraft-singularity"
+        echo ""
+        echo "Usage on Raven HPC:"
+        echo "module load apptainer"
+        echo "apptainer run --nv bindcraft.sif --settings config.json"
+        echo ""
+        echo "Note: First run downloads PyRosetta + AlphaFold params (~6.8GB total)"
+        echo "Subsequent runs are immediate."
