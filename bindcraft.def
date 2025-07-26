@@ -1,0 +1,23 @@
+Bootstrap: docker
+From: nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
+
+%post
+    apt-get update && apt-get install -y \
+        python3 python3-pip git aria2 bc ffmpeg \
+        libgfortran5 libgomp1 python3-dev \
+        && rm -rf /var/lib/apt/lists/*
+    
+    pip install --no-cache-dir \
+        jax==0.4.35 jaxlib==0.4.35 \
+        numpy==2.0.1 scipy==1.15.3 \
+        git+https://github.com/sokrypton/ColabDesign.git \
+        pyrosetta-installer pdbfixer
+    
+    git clone https://github.com/martinpacesa/BindCraft /BindCraft
+    chmod +x /BindCraft/functions/dssp /BindCraft/functions/DAlphaBall.gcc
+
+%environment
+    export PYTHONPATH=/BindCraft:$PYTHONPATH
+
+%runscript
+    exec python3 /BindCraft/bindcraft.py "$@"
