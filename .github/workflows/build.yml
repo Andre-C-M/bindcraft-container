@@ -1,4 +1,4 @@
-name: Build BindCraft Container 
+name: Build BindCraft Container (Simple)
 
 on:
   push:
@@ -22,6 +22,32 @@ jobs:
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /opt/ghc
         df -h
+    
+    - name: Create entrypoint script
+      run: |
+        cat > entrypoint.sh << 'EOF'
+        #!/bin/bash
+        
+        # Download AlphaFold params on first run
+        if [ ! -f /BindCraft/params/done.txt ]; then
+            echo "Downloading AlphaFold parameters (first run only)..."
+            cd /BindCraft/params
+            wget -q --timeout=60 --tries=3 \
+                https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar
+            if [ $? -eq 0 ]; then
+                tar -xf alphafold_params_2022-12-06.tar
+                rm alphafold_params_2022-12-06.tar
+                touch done.txt
+                echo "✓ Parameters downloaded"
+            else
+                echo "⚠ Parameter download failed"
+            fi
+        fi
+        
+        exec python3 /BindCraft/bindcraft.py "$@"
+        EOF
+        
+        chmod +x entrypoint.sh
     
     - name: Create Dockerfile
       run: |
@@ -58,28 +84,8 @@ jobs:
         ENV PYTHONPATH=/BindCraft:$PYTHONPATH
         ENV PATH=/BindCraft:$PATH
         
-        # Create entrypoint script
-        RUN cat > /entrypoint.sh << 'SCRIPT'
-        #!/bin/bash
-        # Download AlphaFold params on first run
-        if [ ! -f /BindCraft/params/done.txt ]; then
-            echo "Downloading AlphaFold parameters (first run only)..."
-            cd /BindCraft/params
-            wget -q --timeout=60 --tries=3 \
-                https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar
-            if [ $? -eq 0 ]; then
-                tar -xf alphafold_params_2022-12-06.tar
-                rm alphafold_params_2022-12-06.tar
-                touch done.txt
-                echo "✓ Parameters downloaded"
-            else
-                echo "⚠ Parameter download failed"
-            fi
-        fi
-        
-        exec python3 /BindCraft/bindcraft.py "$@"
-        SCRIPT
-        
+        # Copy entrypoint script
+        COPY entrypoint.sh /entrypoint.sh
         RUN chmod +x /entrypoint.sh
         
         WORKDIR /workspace
