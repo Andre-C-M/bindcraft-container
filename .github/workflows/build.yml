@@ -1,5 +1,6 @@
-name: Build BindCraft Container
-
+name: Build container
+run: |
+  singularity build --fakeroot --force bindcraft.sif bindcraft.def
 on:
   push:
     branches: [ main ]
