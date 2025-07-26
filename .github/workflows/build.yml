@@ -1,11 +1,14 @@
-name: Build and Push BindCraft to Docker Hub
+name: Build BindCraft Container 
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     
     steps:
     - name: Checkout code
@@ -14,17 +17,29 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
     
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        df -h
+    
     - name: Create Dockerfile
       run: |
         cat > Dockerfile << 'EOF'
         FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
         
+        # Install system dependencies
         RUN export DEBIAN_FRONTEND=noninteractive && \
             apt-get update && apt-get install -y \
-                python3 python3-pip git wget \
-                libgfortran5 libgomp1 && \
+                python3 python3-pip git wget curl \
+                libgfortran5 libgomp1 build-essential \
+                ca-certificates && \
             rm -rf /var/lib/apt/lists/*
         
+        # Upgrade pip
+        RUN python3 -m pip install --upgrade pip setuptools wheel
+        
+        # Install Python packages
         RUN pip install --no-cache-dir \
                 jax==0.4.35 jaxlib==0.4.35 \
                 numpy==2.0.1 scipy==1.15.3 \
@@ -32,45 +47,100 @@ jobs:
                 git+https://github.com/sokrypton/ColabDesign.git \
                 pyrosetta-installer pdbfixer
         
+        # Clone BindCraft
         RUN git clone https://github.com/martinpacesa/BindCraft /BindCraft && \
-            chmod +x /BindCraft/functions/dssp /BindCraft/functions/DAlphaBall.gcc && \
-            mkdir -p /BindCraft/params
+            chmod +x /BindCraft/functions/dssp /BindCraft/functions/DAlphaBall.gcc
         
+        # Create params directory
+        RUN mkdir -p /BindCraft/params
+        
+        # Set environment variables
         ENV PYTHONPATH=/BindCraft:$PYTHONPATH
+        ENV PATH=/BindCraft:$PATH
+        
+        # Create entrypoint script
+        RUN cat > /entrypoint.sh << 'SCRIPT'
+        #!/bin/bash
+        # Download AlphaFold params on first run
+        if [ ! -f /BindCraft/params/done.txt ]; then
+            echo "Downloading AlphaFold parameters (first run only)..."
+            cd /BindCraft/params
+            wget -q --timeout=60 --tries=3 \
+                https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar
+            if [ $? -eq 0 ]; then
+                tar -xf alphafold_params_2022-12-06.tar
+                rm alphafold_params_2022-12-06.tar
+                touch done.txt
+                echo "✓ Parameters downloaded"
+            else
+                echo "⚠ Parameter download failed"
+            fi
+        fi
+        
+        exec python3 /BindCraft/bindcraft.py "$@"
+        SCRIPT
+        
+        RUN chmod +x /entrypoint.sh
         
         WORKDIR /workspace
-        ENTRYPOINT ["python3", "/BindCraft/bindcraft.py"]
+        ENTRYPOINT ["/entrypoint.sh"]
         EOF
     
-    - name: Build and test locally
+    - name: Build Docker image
       run: |
-        docker build -t bindcraft-local .
-        docker run --rm bindcraft-local python3 -c "print('✓ Container works')"
+        echo "Building BindCraft Docker image..."
+        docker build -t bindcraft:latest .
         
-        # Create Singularity-compatible version
-        docker save bindcraft-local | gzip > bindcraft.tar.gz
-        
-        echo "✓ Docker image ready for conversion to Singularity"
-        echo "Image size: $(du -h bindcraft.tar.gz | cut -f1)"
+        echo "✓ Docker image built successfully"
+        docker images bindcraft:latest
     
-    - name: Upload Docker image
+    - name: Test Docker container
+      run: |
+        echo "Testing container..."
+        docker run --rm bindcraft:latest python3 -c "print('✓ Container works')"
+        docker run --rm bindcraft:latest python3 -c "import numpy; print('✓ NumPy:', numpy.__version__)"
+        docker run --rm bindcraft:latest python3 -c "import jax; print('✓ JAX:', jax.__version__)"
+        docker run --rm bindcraft:latest ls -la /BindCraft/ | head -5
+    
+    - name: Convert Docker to Singularity format
+      run: |
+        # Install Singularity for conversion
+        sudo apt-get update
+        sudo apt-get install -y singularity-container
+        
+        # Save Docker image as tar
+        docker save bindcraft:latest | gzip > bindcraft_docker.tar.gz
+        
+        # Create Singularity definition that imports the Docker image
+        cat > bindcraft_final.def << 'EOF'
+        Bootstrap: docker-archive
+        From: bindcraft_docker.tar.gz
+        EOF
+        
+        # Build Singularity container
+        sudo singularity build bindcraft.sif bindcraft_final.def
+        
+        echo "✓ Singularity container created"
+        ls -lh bindcraft.sif
+    
+    - name: Test Singularity container
+      run: |
+        echo "Testing Singularity container..."
+        singularity exec bindcraft.sif python3 -c "print('✓ Singularity container works')"
+    
+    - name: Upload container
       uses: actions/upload-artifact@v4
       with:
-        name: bindcraft-docker-image
-        path: bindcraft.tar.gz
+        name: bindcraft-container
+        path: bindcraft.sif
         retention-days: 30
     
-    - name: Instructions
+    - name: Success message
       run: |
         echo "============================================"
-        echo "✅ BindCraft Docker image ready!"
+        echo "✅ BindCraft container built successfully!"
         echo "============================================"
+        echo "Container size: $(du -h bindcraft.sif | cut -f1)"
         echo ""
-        echo "TO CONVERT TO SINGULARITY:"
-        echo "1. Download bindcraft.tar.gz from artifacts"
-        echo "2. Run: gunzip bindcraft.tar.gz"
-        echo "3. Run: singularity build bindcraft.sif docker-archive://bindcraft.tar"
-        echo ""
-        echo "OR USE DOCKER DIRECTLY:"
-        echo "docker load < bindcraft.tar"
-        echo "docker run --gpus all -v /path/to/data:/workspace bindcraft-local --settings config.json"
+        echo "Download: Actions → Artifacts → bindcraft-container"
+        echo "Usage: singularity run --nv bindcraft.sif --settings config.json"
