@@ -75,11 +75,26 @@ jobs:
         docker run --rm bindcraft-minimal python3 -c "import jax; print('✓ JAX')"
         docker run --rm bindcraft-minimal ls /BindCraft/
     
-    - name: Save Docker image
+    - name: Convert Docker to Singularity format
       run: |
-        echo "Saving Docker image..."
-        docker save bindcraft-minimal | gzip > bindcraft.tar.gz
-        echo "Image saved: $(du -h bindcraft.tar.gz | cut -f1)"
+        # Install Singularity for conversion
+        sudo apt-get update
+        sudo apt-get install -y singularity-container
+        
+        # Save Docker image as tar
+        docker save bindcraft-minimal | gzip > bindcraft_docker.tar.gz
+        
+        # Create Singularity definition that imports the Docker image
+        cat > bindcraft_final.def << 'EOF'
+        Bootstrap: docker-archive
+        From: bindcraft_docker.tar.gz
+        EOF
+        
+        # Build Singularity container
+        sudo singularity build bindcraft.sif bindcraft_final.def
+        
+        echo "✓ Singularity container created"
+        ls -lh bindcraft.sif
     
     - name: Create conversion instructions
       run: |
@@ -104,18 +119,15 @@ jobs:
       with:
         name: bindcraft-container
         path: |
-          bindcraft.tar.gz
-          CONVERSION_INSTRUCTIONS.txt
+          bindcraft.sif
         retention-days: 30
     
     - name: Success message
       run: |
         echo "============================================"
-        echo "✅ BindCraft Docker image built successfully!"
+        echo "✅ BindCraft Singularity container ready!"
         echo "============================================"
-        echo "Image size: $(du -h bindcraft.tar.gz | cut -f1)"
+        echo "Container size: $(du -h bindcraft.sif | cut -f1)"
         echo ""
         echo "Download from: Actions → Artifacts → bindcraft-container"
-        echo "Files included:"
-        echo "- bindcraft.tar.gz (Docker image)"
-        echo "- CONVERSION_INSTRUCTIONS.txt (how to convert)"
+        echo "Usage on Raven: singularity run --nv bindcraft.sif --settings config.json"
